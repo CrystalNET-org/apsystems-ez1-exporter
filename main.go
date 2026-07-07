@@ -91,23 +91,40 @@ func fetch[T any](c *ez1Client, path string) (T, error) {
 
 // outputSnapshot holds the latest polled high-resolution power/energy data
 // (/getOutputData), refreshed on its own ticker independent of statusSnapshot.
+//
+// Momentary power (P1/P2) is zeroed out whenever we don't have a fresh
+// confirmed reading (poll failure, or outside the daylight window) - it can
+// genuinely swing to zero at any moment, so serving a stale nonzero value
+// would be actively misleading. The energy counters (E1/E2/Te1/Te2) are
+// cumulative and only ever move forward, so they keep their last known-good
+// value instead of being zeroed, which would show up as a false dip.
 type outputSnapshot struct {
-	mu      sync.RWMutex
-	data    outputData
-	ok      bool
-	updated time.Time
+	mu       sync.RWMutex
+	data     outputData
+	ok       bool
+	daylight bool
+	updated  time.Time
 }
 
-func (s *outputSnapshot) set(data outputData, ok bool) {
+func (s *outputSnapshot) setSuccess(data outputData, daylight bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data, s.ok, s.updated = data, ok, time.Now()
+	s.data, s.ok, s.daylight, s.updated = data, true, daylight, time.Now()
 }
 
-func (s *outputSnapshot) get() (outputData, bool, time.Time) {
+// setPowerUnknown records a poll failure or a night-time skip: P1/P2 are
+// zeroed, but the previously recorded energy counters are left untouched.
+func (s *outputSnapshot) setPowerUnknown(ok, daylight bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.P1, s.data.P2 = 0, 0
+	s.ok, s.daylight, s.updated = ok, daylight, time.Now()
+}
+
+func (s *outputSnapshot) get() (outputData, bool, bool, time.Time) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.data, s.ok, s.updated
+	return s.data, s.ok, s.daylight, s.updated
 }
 
 // statusSnapshot holds the latest polled low-resolution data - device info,
@@ -151,15 +168,22 @@ func pollEvery(ctx context.Context, interval time.Duration, poll func()) {
 	}
 }
 
-func pollOutput(ctx context.Context, client *ez1Client, interval time.Duration, snap *outputSnapshot) {
+func pollOutput(ctx context.Context, client *ez1Client, interval time.Duration, snap *outputSnapshot, daylight *daylightWindow) {
 	pollEvery(ctx, interval, func() {
+		if daylight != nil && !daylight.isDaylight(time.Now()) {
+			// outside the configured daylight window - the device won't be
+			// generating anything, so skip hitting it. This is a confirmed
+			// zero (ok=true), not an unknown/failed one.
+			snap.setPowerUnknown(true, false)
+			return
+		}
 		data, err := fetch[outputData](client, "/getOutputData")
 		if err != nil {
 			slog.Error("failed to poll output data", "error", err)
-			snap.set(outputData{}, false)
+			snap.setPowerUnknown(false, true)
 			return
 		}
-		snap.set(data, true)
+		snap.setSuccess(data, true)
 	})
 }
 
@@ -199,6 +223,7 @@ type collector struct {
 
 	outputUp             *prometheus.Desc
 	outputLastUpdate     *prometheus.Desc
+	daylight             *prometheus.Desc
 	statusUp             *prometheus.Desc
 	statusLastUpdate     *prometheus.Desc
 	info                 *prometheus.Desc
@@ -216,8 +241,9 @@ func newCollector(output *outputSnapshot, status *statusSnapshot) *collector {
 	return &collector{
 		output:               output,
 		status:               status,
-		outputUp:             prometheus.NewDesc("ez1_output_up", "Whether the last poll of /getOutputData succeeded (1) or not (0).", nil, nil),
-		outputLastUpdate:     prometheus.NewDesc("ez1_output_last_update_timestamp_seconds", "Unix timestamp of the last /getOutputData poll attempt.", nil, nil),
+		outputUp:             prometheus.NewDesc("ez1_output_up", "Whether the last poll of /getOutputData succeeded (1) or not (0); always 1 outside the configured daylight window, since no poll is attempted.", nil, nil),
+		outputLastUpdate:     prometheus.NewDesc("ez1_output_last_update_timestamp_seconds", "Unix timestamp of the last /getOutputData poll attempt (or daylight-window check).", nil, nil),
+		daylight:             prometheus.NewDesc("ez1_daylight", "Whether the current time is within the configured daylight (civil dawn to civil dusk) window. Always 1 if no location is configured.", nil, nil),
 		statusUp:             prometheus.NewDesc("ez1_status_up", "Whether the last poll of device info/max power/alarm/on-off succeeded (1) or not (0).", nil, nil),
 		statusLastUpdate:     prometheus.NewDesc("ez1_status_last_update_timestamp_seconds", "Unix timestamp of the last device info/max power/alarm/on-off poll attempt.", nil, nil),
 		info:                 prometheus.NewDesc("ez1_info", "Static EZ1 device information.", []string{"device_id", "dev_ver", "ssid", "ip_addr"}, nil),
@@ -235,6 +261,7 @@ func newCollector(output *outputSnapshot, status *statusSnapshot) *collector {
 func (col *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- col.outputUp
 	ch <- col.outputLastUpdate
+	ch <- col.daylight
 	ch <- col.statusUp
 	ch <- col.statusLastUpdate
 	ch <- col.info
@@ -249,22 +276,26 @@ func (col *collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (col *collector) Collect(ch chan<- prometheus.Metric) {
-	output, outputOK, outputUpdated := col.output.get()
+	output, outputOK, daylight, outputUpdated := col.output.get()
 	info, maxPower, alarm, onOff, statusOK, statusUpdated := col.status.get()
 
 	ch <- prometheus.MustNewConstMetric(col.outputUp, prometheus.GaugeValue, boolToFloat(outputOK))
 	ch <- prometheus.MustNewConstMetric(col.outputLastUpdate, prometheus.GaugeValue, float64(outputUpdated.Unix()))
+	ch <- prometheus.MustNewConstMetric(col.daylight, prometheus.GaugeValue, boolToFloat(daylight))
 	ch <- prometheus.MustNewConstMetric(col.statusUp, prometheus.GaugeValue, boolToFloat(statusOK))
 	ch <- prometheus.MustNewConstMetric(col.statusLastUpdate, prometheus.GaugeValue, float64(statusUpdated.Unix()))
 
-	if outputOK {
-		ch <- prometheus.MustNewConstMetric(col.powerWatts, prometheus.GaugeValue, output.P1, "1")
-		ch <- prometheus.MustNewConstMetric(col.powerWatts, prometheus.GaugeValue, output.P2, "2")
-		ch <- prometheus.MustNewConstMetric(col.energySinceStartup, prometheus.GaugeValue, output.E1, "1")
-		ch <- prometheus.MustNewConstMetric(col.energySinceStartup, prometheus.GaugeValue, output.E2, "2")
-		ch <- prometheus.MustNewConstMetric(col.energyLifetime, prometheus.GaugeValue, output.Te1, "1")
-		ch <- prometheus.MustNewConstMetric(col.energyLifetime, prometheus.GaugeValue, output.Te2, "2")
-	}
+	// always emitted, never omitted: power is explicitly zeroed by the
+	// poller on both failure and night-time skip (see outputSnapshot's
+	// doc comment), so there's no stale power reading to worry about here.
+	// The energy counters below deliberately keep their last known-good
+	// value instead of being zeroed alongside power.
+	ch <- prometheus.MustNewConstMetric(col.powerWatts, prometheus.GaugeValue, output.P1, "1")
+	ch <- prometheus.MustNewConstMetric(col.powerWatts, prometheus.GaugeValue, output.P2, "2")
+	ch <- prometheus.MustNewConstMetric(col.energySinceStartup, prometheus.GaugeValue, output.E1, "1")
+	ch <- prometheus.MustNewConstMetric(col.energySinceStartup, prometheus.GaugeValue, output.E2, "2")
+	ch <- prometheus.MustNewConstMetric(col.energyLifetime, prometheus.GaugeValue, output.Te1, "1")
+	ch <- prometheus.MustNewConstMetric(col.energyLifetime, prometheus.GaugeValue, output.Te2, "2")
 
 	if !statusOK {
 		return
@@ -339,6 +370,14 @@ func main() {
 	outputInterval := envDuration("EZ1_OUTPUT_INTERVAL", 10*time.Second)
 	statusInterval := envDuration("EZ1_STATUS_INTERVAL", 5*time.Minute)
 
+	// day/night-aware output polling is entirely optional - if neither is
+	// set, daylight is nil and pollOutput polls around the clock as before.
+	daylight, err := resolveLocation(os.Getenv("EZ1_LOCATION_LATLONG"), os.Getenv("EZ1_LOCATION_CITY"))
+	if err != nil {
+		slog.Error("failed to resolve EZ1_LOCATION_LATLONG/EZ1_LOCATION_CITY", "error", err)
+		os.Exit(1)
+	}
+
 	client := newEz1Client(targetURL, requestTimeout)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -346,7 +385,7 @@ func main() {
 
 	output := &outputSnapshot{}
 	status := &statusSnapshot{}
-	go pollOutput(ctx, client, outputInterval, output)
+	go pollOutput(ctx, client, outputInterval, output, daylight)
 	go pollStatus(ctx, client, statusInterval, status)
 
 	registry := prometheus.NewRegistry()
